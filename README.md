@@ -10,6 +10,8 @@ Build a timed, multi-question test, mint one link per candidate, copy it into yo
 own email. Candidate opens the link, signs in with the invited Google account,
 accepts the rules, and gets a locked-down test screen.
 
+
+
 - **Invite links** — one token per candidate, single-use, with an expiry window.
   The Google account used to sign in **must match** the invited address.
 - **Server-authoritative timer** — `endsAt` is frozen when the candidate presses
