@@ -3,12 +3,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { CodeEditor, EditChange } from "@/components/CodeEditor";
-import { getMonacoLanguage, languageName } from "@/lib/languages";
+import { getMonacoLanguage, languageName, defaultLanguageFor } from "@/lib/languages";
 import { ProctorGuard } from "@/components/ProctorGuard";
 import { FullscreenGate } from "@/components/FullscreenGate";
 import { MultiDisplayGate } from "@/components/MultiDisplayGate";
 import { TestTimer } from "@/components/TestTimer";
 import { ConnectionBanner, SaveState, formatDuration } from "@/components/ConnectionBanner";
+import { ResizeHandle } from "@/components/ResizeHandle";
+import { EditorSettingsMenu } from "@/components/EditorSettingsMenu";
+import { useEditorLayout, DEFAULT_LAYOUT, NUDGE_PCT, NUDGE_PX } from "@/lib/editor-layout";
 import { markdownToHtml } from "@/lib/markdown";
 import { statusLabel, isAccepted, isFailed, JUDGE0_WRONG_ANSWER } from "@/lib/judge0-status";
 import { fetchJson, postJson, HttpError, errorMessage } from "@/lib/fetch-json";
@@ -32,6 +35,9 @@ import {
   FINISH_ATTEMPTS,
   FINISH_RETRY_MS,
   isSilentEvent,
+  violationLevel,
+  VIOLATION_MESSAGES,
+  VIOLATION_BADGES,
 } from "@/lib/proctor-config";
 
 /** Cadence of the grading poll, and how long it keeps asking before giving up. */
@@ -125,6 +131,7 @@ export default function SessionPage() {
   const [deadline, setDeadline] = useState<number | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [confirmFinish, setConfirmFinish] = useState(false);
+  const [confirmReset, setConfirmReset] = useState(false);
   const [ending, setEnding] = useState(false);
 
   // ---- Connection state ----
@@ -146,6 +153,41 @@ export default function SessionPage() {
   const tabId = useMemo(
     () => Math.random().toString(36).slice(2) + Date.now().toString(36),
     []
+  );
+
+  // ---- Panel sizing -------------------------------------------------------
+  const { layout, set: setLayout, reset: resetLayout } = useEditorLayout();
+  /** The row holding the rail, the problem panel and the editor column. */
+  const rowRef = useRef<HTMLDivElement>(null);
+  const problemRef = useRef<HTMLDivElement>(null);
+  const columnRef = useRef<HTMLDivElement>(null);
+
+  const dragSplit = useCallback(
+    (clientX: number) => {
+      const row = rowRef.current;
+      const panel = problemRef.current;
+      if (!row || !panel) return;
+      const rowWidth = row.getBoundingClientRect().width;
+      if (rowWidth <= 0) return;
+      // Measured from the panel's own left edge rather than the row's: the
+      // question rail sits between them, and its width must not be counted as
+      // problem-panel width or the panel would trail the cursor by 64px.
+      const left = panel.getBoundingClientRect().left;
+      setLayout({ splitPct: ((clientX - left) / rowWidth) * 100 });
+    },
+    [setLayout]
+  );
+
+  const dragResults = useCallback(
+    (_clientX: number, clientY: number) => {
+      const column = columnRef.current;
+      if (!column) return;
+      const rect = column.getBoundingClientRect();
+      // The drawer grows upward, and is not allowed to push the editor below a
+      // usable height however far the pointer travels.
+      setLayout({ resultsPx: Math.min(rect.bottom - clientY, rect.height - 160) });
+    },
+    [setLayout]
   );
 
   const startedAt = useRef(Date.now());
@@ -419,12 +461,10 @@ export default function SessionPage() {
         if (!body.counted) {
           if (!isSilentEvent(event)) flash(BLOCKED_MESSAGES[event] ?? BLOCKED_FALLBACK);
         } else if (event !== "fullscreen_exit") {
-          // The fullscreen overlay already shows its own counter.
-          flash(
-            body.maxViolations > 0
-              ? `Warning ${body.violationCount} of ${body.maxViolations} — this was recorded.`
-              : "This action was recorded."
-          );
+          // The fullscreen overlay says this itself, in its own copy.
+          // No tally here — see the note above VIOLATION_MESSAGES.
+          const level = violationLevel(body.violationCount, body.maxViolations);
+          if (level !== "none") flash(VIOLATION_MESSAGES[level]);
         }
       } catch (err) {
         // Never let a logging failure interfere with the test — but do not let an
@@ -447,6 +487,14 @@ export default function SessionPage() {
         const body = await postJson(`/api/session/${sessionId}/event`, next);
         pendingEvents.current.shift();
         setViolations({ count: body.violationCount, max: body.maxViolations });
+        // A violation that happened during an outage is still a violation the
+        // candidate has to be told about — otherwise the only notice they get
+        // is the auto-submit. Flushing several in a row settles on the last
+        // message, which is the most severe, so that is the right one to leave up.
+        if (body.counted) {
+          const level = violationLevel(body.violationCount, body.maxViolations);
+          if (level !== "none") flash(VIOLATION_MESSAGES[level]);
+        }
         if (body.terminated) {
           flash("Too many violations — your test has been submitted.");
           endTest("terminated");
@@ -521,7 +569,7 @@ export default function SessionPage() {
             continue;
           }
 
-          const langId = p.draft?.languageId ?? p.allowedLanguages[0];
+          const langId = p.draft?.languageId ?? defaultLanguageFor(p.allowedLanguages);
           initial[p.id] = {
             languageId: langId,
             code: p.draft?.code ?? p.starterCode[String(langId)] ?? "",
@@ -723,6 +771,24 @@ export default function SessionPage() {
       const untouched =
         !cur?.code?.trim() || cur.code === problem.starterCode[String(cur.languageId)];
       const code = untouched ? problem.starterCode[String(languageId)] ?? "" : cur?.code ?? "";
+
+      mirrorDraft(problem.id, code, languageId);
+      setEditors((prev) => ({ ...prev, [problem.id]: { code, languageId } }));
+    },
+    [mirrorDraft]
+  );
+
+  /**
+   * Throw away the current buffer and put the starter template for the language
+   * back. Deliberately not routed through `updateCode`: that one bails when the
+   * text is unchanged, and a reset has to mirror the draft even then so the
+   * stored copy can never survive a reset the editor already shows.
+   */
+  const resetCode = useCallback(
+    (problem: SessionProblem) => {
+      const languageId =
+        editorsRef.current[problem.id]?.languageId ?? defaultLanguageFor(problem.allowedLanguages);
+      const code = problem.starterCode[String(languageId)] ?? "";
 
       mirrorDraft(problem.id, code, languageId);
       setEditors((prev) => ({ ...prev, [problem.id]: { code, languageId } }));
@@ -1010,11 +1076,16 @@ export default function SessionPage() {
     );
   }
 
-  const editor = editors[active.id] ?? { code: "", languageId: active.allowedLanguages[0] };
+  const editor = editors[active.id] ?? {
+    code: "",
+    languageId: defaultLanguageFor(active.allowedLanguages),
+  };
   const result = results[active.id];
   const resultError = resultErrors[active.id] ?? null;
   const activeBusy = busy[active.id];
   const solvedCount = problems.filter((p) => p.solved).length;
+  // Tone only — the tally behind it is never rendered.
+  const violationBadgeLevel = violationLevel(violations.count, violations.max);
 
   return (
     <>
@@ -1036,9 +1107,15 @@ export default function SessionPage() {
                 unsyncedCount={unsyncedCount}
                 hasSaved={lastSyncedAt !== null}
               />
-              {violations.max > 0 && violations.count > 0 && (
-                <span className="text-xs px-2 py-1 rounded bg-red-950 text-red-300 border border-red-900">
-                  ⚠ {violations.count}/{violations.max} warnings
+              {violations.max > 0 && violationBadgeLevel !== "none" && (
+                <span
+                  className={`text-xs px-2 py-1 rounded border ${
+                    violationBadgeLevel === "noted"
+                      ? "bg-amber-950 text-amber-300 border-amber-900"
+                      : "bg-red-950 text-red-300 border-red-900"
+                  }`}
+                >
+                  ⚠ {VIOLATION_BADGES[violationBadgeLevel]}
                 </span>
               )}
               <div className="flex flex-col items-end gap-0.5">
@@ -1074,7 +1151,7 @@ export default function SessionPage() {
             localSaveFailed={localSaveFailed}
           />
 
-          <div className="flex flex-1 overflow-hidden">
+          <div ref={rowRef} className="flex flex-1 overflow-hidden">
             {/* Question rail */}
             <nav className="w-16 bg-gray-950 border-r border-gray-800 flex flex-col items-center py-3 gap-2 shrink-0">
               {problems.map((p, i) => (
@@ -1108,7 +1185,11 @@ export default function SessionPage() {
             </nav>
 
             {/* Problem statement */}
-            <div className="w-2/5 overflow-y-auto border-r border-gray-700 p-4">
+            <div
+              ref={problemRef}
+              style={{ width: `${layout.splitPct}%` }}
+              className="shrink-0 overflow-y-auto p-4"
+            >
               <div className="flex items-center gap-2 mb-3">
                 <h2 className="text-lg font-semibold">{active.title}</h2>
                 <span className="text-xs px-2 py-0.5 rounded bg-gray-800 text-gray-400">
@@ -1153,8 +1234,16 @@ export default function SessionPage() {
               </p>
             </div>
 
+            <ResizeHandle
+              axis="x"
+              label="Resize the problem panel"
+              onMove={dragSplit}
+              onNudge={(steps) => setLayout({ splitPct: layout.splitPct + steps * NUDGE_PCT })}
+              onReset={() => setLayout({ splitPct: DEFAULT_LAYOUT.splitPct })}
+            />
+
             {/* Editor + results */}
-            <div className="flex-1 flex flex-col min-w-0">
+            <div ref={columnRef} className="flex-1 flex flex-col min-w-0">
               <div className="flex items-center justify-between px-3 py-2 bg-gray-800 border-b border-gray-700 shrink-0">
                 <select
                   value={editor.languageId}
@@ -1169,6 +1258,19 @@ export default function SessionPage() {
                 </select>
 
                 <div className="flex items-center gap-2">
+                  <EditorSettingsMenu
+                    fontSize={layout.fontSize}
+                    onFontSize={(fontSize) => setLayout({ fontSize })}
+                    onResetLayout={resetLayout}
+                  />
+                  <button
+                    onClick={() => setConfirmReset(true)}
+                    disabled={!!activeBusy}
+                    title="Restore the starter template for this question"
+                    className="px-3 py-1.5 bg-gray-700 rounded text-sm font-medium hover:bg-gray-600 disabled:opacity-50"
+                  >
+                    Reset code
+                  </button>
                   <button
                     onClick={() => execute(active, "run")}
                     disabled={!!activeBusy}
@@ -1195,10 +1297,19 @@ export default function SessionPage() {
                   proctored
                   onEdit={(change) => handleEdit(active.id, change)}
                   onBlocked={reportEvent}
+                  fontSize={layout.fontSize}
                 />
               </div>
 
-              <ResultsPanel result={result} error={resultError} busy={!!activeBusy} />
+              <ResultsPanel
+                result={result}
+                error={resultError}
+                busy={!!activeBusy}
+                height={layout.resultsPx}
+                onMove={dragResults}
+                onNudge={(steps) => setLayout({ resultsPx: layout.resultsPx + steps * NUDGE_PX })}
+                onReset={() => setLayout({ resultsPx: DEFAULT_LAYOUT.resultsPx })}
+              />
             </div>
           </div>
         </div>
@@ -1209,6 +1320,38 @@ export default function SessionPage() {
       {toast && (
         <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[110] bg-red-600 text-white px-5 py-3 rounded-lg shadow-xl text-sm font-medium">
           ⚠️ {toast}
+        </div>
+      )}
+
+      {/* Reset confirmation */}
+      {confirmReset && (
+        <div className="fixed inset-0 z-[120] bg-black/80 flex items-center justify-center px-4">
+          <div className="bg-gray-800 border border-gray-700 rounded-xl p-6 max-w-md w-full">
+            <h2 className="text-lg font-semibold mb-2">⚠️ Reset your code?</h2>
+            <p className="text-sm text-gray-400 mb-4">
+              Everything you have written for{" "}
+              <strong className="text-white">{active.title}</strong> in{" "}
+              <strong className="text-white">{languageName(editor.languageId)}</strong> is
+              discarded and the editor goes back to the starter template. This cannot be undone.
+            </p>
+            <div className="flex gap-3">
+              <button
+                onClick={() => setConfirmReset(false)}
+                className="flex-1 px-4 py-2.5 bg-gray-700 rounded font-medium hover:bg-gray-600"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  resetCode(active);
+                  setConfirmReset(false);
+                }}
+                className="flex-1 px-4 py-2.5 bg-red-600 rounded font-medium hover:bg-red-700"
+              >
+                Reset code
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
@@ -1306,11 +1449,21 @@ function ResultsPanel({
   result,
   error,
   busy,
+  height,
+  onMove,
+  onNudge,
+  onReset,
 }: {
   result: RunResult | null;
   error: string | null;
   busy: boolean;
+  height: number;
+  onMove: (clientX: number, clientY: number) => void;
+  onNudge: (steps: number) => void;
+  onReset: () => void;
 }) {
+  // The handle belongs to the drawer, not to the column: there is nothing to
+  // resize on a screen that has not been run yet.
   if (!result && !error && !busy) return null;
 
   // Defended rather than assumed: anything that reaches this panel without its
@@ -1320,7 +1473,20 @@ function ResultsPanel({
   const passedCount = runs.filter((r) => isAccepted(r.statusId)).length;
 
   return (
-    <div className="h-56 overflow-y-auto border-t border-gray-700 bg-gray-800 p-3 shrink-0">
+    <>
+      <ResizeHandle
+        axis="y"
+        label="Resize the results panel"
+        onMove={onMove}
+        onNudge={onNudge}
+        onReset={onReset}
+      />
+      {/* `maxHeight` is what keeps a height dragged tall on a big screen from
+          swallowing the editor when the window is later made small. */}
+      <div
+        style={{ height, maxHeight: "70%" }}
+        className="overflow-y-auto bg-gray-800 p-3 shrink-0"
+      >
       {error && (
         <p className="text-sm text-yellow-300 bg-yellow-950/40 border border-yellow-900 rounded px-3 py-2 mb-3">
           {error}
@@ -1413,6 +1579,7 @@ function ResultsPanel({
             ))}
         </>
       )}
-    </div>
+      </div>
+    </>
   );
 }

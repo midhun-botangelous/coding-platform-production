@@ -4,8 +4,16 @@ import { useSession } from "next-auth/react";
 import { useRouter, useParams } from "next/navigation";
 import { useEffect, useRef, useState, useCallback } from "react";
 import { CodeEditor } from "@/components/CodeEditor";
-import { getMonacoLanguage, languageName } from "@/lib/languages";
+import {
+  getMonacoLanguage,
+  languageName,
+  DEFAULT_LANGUAGE_ID,
+  defaultLanguageFor,
+} from "@/lib/languages";
 import { ProctorGuard, requestFullscreen } from "@/components/ProctorGuard";
+import { ResizeHandle } from "@/components/ResizeHandle";
+import { EditorSettingsMenu } from "@/components/EditorSettingsMenu";
+import { useEditorLayout, DEFAULT_LAYOUT, NUDGE_PCT, NUDGE_PX } from "@/lib/editor-layout";
 import { markdownToHtml } from "@/lib/markdown";
 import { fetchJson, postJson, errorMessage } from "@/lib/fetch-json";
 import {
@@ -19,9 +27,6 @@ import {
 // silently dropped from polling for as long as the tab stays open.
 const POLL_INTERVAL_MS = 1500;
 const MAX_POLLS = 80;
-
-// Only used until the problem's own language list arrives.
-const DEFAULT_LANGUAGE_ID = 71;
 
 interface Problem {
   id: string;
@@ -71,9 +76,41 @@ export default function TestPage() {
   const [violations, setViolations] = useState<string[]>([]);
   const [testStarted, setTestStarted] = useState(false);
   const [showWarning, setShowWarning] = useState(false);
+  const [confirmReset, setConfirmReset] = useState(false);
+  // Language the candidate picked but has not yet confirmed losing their code for.
+  const [pendingLang, setPendingLang] = useState<number | null>(null);
 
   const mounted = useRef(true);
   const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // ---- Panel sizing. Shared with the assessment screen, so a candidate who
+  // sized one finds the other already the way they left it.
+  const { layout, set: setLayout, reset: resetLayout } = useEditorLayout();
+  const rowRef = useRef<HTMLDivElement>(null);
+  const problemRef = useRef<HTMLDivElement>(null);
+  const columnRef = useRef<HTMLDivElement>(null);
+
+  const dragSplit = useCallback(
+    (clientX: number) => {
+      const row = rowRef.current;
+      const panel = problemRef.current;
+      if (!row || !panel) return;
+      const rowWidth = row.getBoundingClientRect().width;
+      if (rowWidth <= 0) return;
+      setLayout({ splitPct: ((clientX - panel.getBoundingClientRect().left) / rowWidth) * 100 });
+    },
+    [setLayout]
+  );
+
+  const dragResults = useCallback(
+    (_clientX: number, clientY: number) => {
+      const column = columnRef.current;
+      if (!column) return;
+      const rect = column.getBoundingClientRect();
+      setLayout({ resultsPx: Math.min(rect.bottom - clientY, rect.height - 160) });
+    },
+    [setLayout]
+  );
 
   useEffect(() => {
     if (status === "unauthenticated") router.push("/");
@@ -98,11 +135,11 @@ export default function TestPage() {
         if (cancelled) return;
 
         const langs = parseLanguageIds(data.allowedLanguages);
-        const first = langs[0] ?? DEFAULT_LANGUAGE_ID;
+        const initial = defaultLanguageFor(langs);
 
         setProblem(data);
-        setSelectedLang(first);
-        setCode(data.starterCode?.[String(first)] ?? "");
+        setSelectedLang(initial);
+        setCode(data.starterCode?.[String(initial)] ?? "");
       } catch (err) {
         if (!cancelled) setLoadError(errorMessage(err, "Could not load this problem."));
       }
@@ -116,6 +153,12 @@ export default function TestPage() {
   // Nothing typed here is persisted anywhere, so an overwritten buffer is gone
   // for good: only reseed code the candidate never touched, leave it alone when
   // the new language ships no template, and ask before discarding real work.
+  //
+  // The ask is an in-page modal rather than window.confirm because every browser
+  // drops the document out of fullscreen to show a native dialog, which
+  // ProctorGuard then reports as a fullscreen_exit violation — a candidate would
+  // be penalised for changing language. Switching is therefore deferred until
+  // they answer: cancelling leaves both the language and the code untouched.
   const changeLanguage = (nextLang: number) => {
     if (!problem || nextLang === selectedLang) return;
 
@@ -123,17 +166,27 @@ export default function TestPage() {
     const untouched =
       !code.trim() || code === (problem.starterCode?.[String(selectedLang)] ?? "");
 
-    if (
-      starter &&
-      (untouched ||
-        window.confirm(
-          `Load the ${languageName(nextLang)} starter template? Your current code will be replaced.`
-        ))
-    ) {
-      setCode(starter);
+    if (starter && !untouched) {
+      setPendingLang(nextLang);
+      return;
     }
 
+    if (starter) setCode(starter);
     setSelectedLang(nextLang);
+  };
+
+  /** Carry out the switch the candidate just confirmed in the modal. */
+  const applyPendingLang = () => {
+    if (pendingLang === null) return;
+    setCode(problem?.starterCode?.[String(pendingLang)] ?? "");
+    setSelectedLang(pendingLang);
+    setPendingLang(null);
+  };
+
+  /** Put the starter template for the selected language back in the editor. */
+  const resetCode = () => {
+    setCode(problem?.starterCode?.[String(selectedLang)] ?? "");
+    setConfirmReset(false);
   };
 
   const handleStartTest = () => {
@@ -298,6 +351,19 @@ export default function TestPage() {
               </option>
             ))}
           </select>
+          <EditorSettingsMenu
+            fontSize={layout.fontSize}
+            onFontSize={(fontSize) => setLayout({ fontSize })}
+            onResetLayout={resetLayout}
+          />
+          <button
+            onClick={() => setConfirmReset(true)}
+            disabled={submitting}
+            title="Restore the starter template for this problem"
+            className="px-3 py-1.5 bg-gray-700 rounded text-sm font-medium hover:bg-gray-600 disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            Reset code
+          </button>
           <button
             onClick={handleSubmit}
             disabled={submitting}
@@ -309,9 +375,13 @@ export default function TestPage() {
       </header>
 
       {/* Main content */}
-      <div className="flex flex-1 overflow-hidden">
+      <div ref={rowRef} className="flex flex-1 overflow-hidden">
         {/* Left panel — Problem description */}
-        <div className="w-2/5 overflow-y-auto p-4 border-r border-gray-700">
+        <div
+          ref={problemRef}
+          style={{ width: `${layout.splitPct}%` }}
+          className="shrink-0 overflow-y-auto p-4"
+        >
           <div className="prose prose-invert prose-sm max-w-none">
             <div dangerouslySetInnerHTML={{ __html: markdownToHtml(problem.description) }} />
           </div>
@@ -334,14 +404,23 @@ export default function TestPage() {
           </div>
         </div>
 
+        <ResizeHandle
+          axis="x"
+          label="Resize the problem panel"
+          onMove={dragSplit}
+          onNudge={(steps) => setLayout({ splitPct: layout.splitPct + steps * NUDGE_PCT })}
+          onReset={() => setLayout({ splitPct: DEFAULT_LAYOUT.splitPct })}
+        />
+
         {/* Right panel — Editor + Results */}
-        <div className="flex-1 flex flex-col">
+        <div ref={columnRef} className="flex-1 flex flex-col min-w-0">
           {/* Code editor */}
           <div className="flex-1 min-h-0">
             <CodeEditor
               language={getMonacoLanguage(selectedLang)}
               value={code}
               onChange={setCode}
+              fontSize={layout.fontSize}
             />
           </div>
 
@@ -353,7 +432,18 @@ export default function TestPage() {
 
           {/* Results panel */}
           {result && (
-            <div className="h-48 overflow-y-auto border-t border-gray-700 bg-gray-800 p-3">
+            <>
+            <ResizeHandle
+              axis="y"
+              label="Resize the results panel"
+              onMove={dragResults}
+              onNudge={(steps) => setLayout({ resultsPx: layout.resultsPx + steps * NUDGE_PX })}
+              onReset={() => setLayout({ resultsPx: DEFAULT_LAYOUT.resultsPx })}
+            />
+            <div
+              style={{ height: layout.resultsPx, maxHeight: "70%" }}
+              className="shrink-0 overflow-y-auto bg-gray-800 p-3"
+            >
               <div className="flex items-center gap-4 mb-3">
                 <h3 className="font-semibold text-sm">
                   Results: {result.score}/{result.maxScore}
@@ -423,9 +513,70 @@ export default function TestPage() {
                   </div>
                 ))}
             </div>
+            </>
           )}
         </div>
       </div>
+
+      {/* Reset confirmation */}
+      {confirmReset && (
+        <div className="fixed inset-0 z-[120] bg-black/80 flex items-center justify-center px-4">
+          <div className="bg-gray-800 border border-gray-700 rounded-xl p-6 max-w-md w-full">
+            <h2 className="text-lg font-semibold mb-2">⚠️ Reset your code?</h2>
+            <p className="text-sm text-gray-400 mb-4">
+              Everything you have written in{" "}
+              <strong className="text-white">{languageName(selectedLang)}</strong> is discarded
+              and the editor goes back to the starter template. This cannot be undone.
+            </p>
+            <div className="flex gap-3">
+              <button
+                onClick={() => setConfirmReset(false)}
+                className="flex-1 px-4 py-2.5 bg-gray-700 rounded font-medium hover:bg-gray-600"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={resetCode}
+                className="flex-1 px-4 py-2.5 bg-red-600 rounded font-medium hover:bg-red-700"
+              >
+                Reset code
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Language switch confirmation */}
+      {pendingLang !== null && (
+        <div className="fixed inset-0 z-[120] bg-black/80 flex items-center justify-center px-4">
+          <div className="bg-gray-800 border border-gray-700 rounded-xl p-6 max-w-md w-full">
+            <h2 className="text-lg font-semibold mb-2">
+              ⚠️ Switch to {languageName(pendingLang)}?
+            </h2>
+            <p className="text-sm text-gray-400 mb-4">
+              The editor loads the{" "}
+              <strong className="text-white">{languageName(pendingLang)}</strong> starter
+              template and everything you have written in{" "}
+              <strong className="text-white">{languageName(selectedLang)}</strong> is
+              discarded. This cannot be undone.
+            </p>
+            <div className="flex gap-3">
+              <button
+                onClick={() => setPendingLang(null)}
+                className="flex-1 px-4 py-2.5 bg-gray-700 rounded font-medium hover:bg-gray-600"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={applyPendingLang}
+                className="flex-1 px-4 py-2.5 bg-red-600 rounded font-medium hover:bg-red-700"
+              >
+                Switch language
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
